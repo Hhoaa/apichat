@@ -674,6 +674,199 @@ def chat_with_image():
         return jsonify({"error": f"Lỗi máy chủ: {str(e)}"}), 500
 
 
+# -----------------------------
+# Size recommendation helpers
+# -----------------------------
+
+def _parse_number(s: Any) -> float | None:
+    try:
+        if s is None:
+            return None
+        if isinstance(s, (int, float)):
+            return float(s)
+        s = str(s).strip().lower()
+        if not s:
+            return None
+        # Remove units and non-numeric except dot and comma
+        s = s.replace('cm', '').replace('kg', '').replace('m', ' ').replace(',', '.')
+        s = ''.join(ch for ch in s if ch.isdigit() or ch == '.' or ch == ' ')
+        s = s.strip()
+        if not s:
+            return None
+        # If looks like meters (e.g., 1.65), convert to cm later by caller
+        return float(s)
+    except Exception:
+        return None
+
+
+def parse_height_cm(height: Any) -> float | None:
+    h = _parse_number(height)
+    if h is None:
+        return None
+    # If clearly meters (e.g., 1.5 to 2.5), convert to cm
+    if 1.3 <= h <= 2.3:
+        return h * 100.0
+    # If looks like centimeters
+    if 130 <= h <= 230:
+        return float(h)
+    return None
+
+
+def parse_weight_kg(weight: Any) -> float | None:
+    w = _parse_number(weight)
+    if w is None:
+        return None
+    # reasonable human weights
+    if 30 <= w <= 200:
+        return float(w)
+    return None
+
+
+def recommend_size(
+    *,
+    height_cm: float | None,
+    weight_kg: float | None,
+    bust_cm: float | None = None,
+    waist_cm: float | None = None,
+    hip_cm: float | None = None,
+    category: str | None = None,  # 'top' | 'bottom' | 'dress' | None
+    gender: str | None = None,
+) -> dict:
+    """Heuristic size recommendation. Returns dict with size, range, reasoning."""
+    size = 'M'
+    reasons: list[str] = []
+
+    # Fallback charts (VN female general). Adjust as needed.
+    top_chart = [
+        {'size': 'S', 'bust_max': 84, 'waist_max': 66},
+        {'size': 'M', 'bust_max': 88, 'waist_max': 70},
+        {'size': 'L', 'bust_max': 92, 'waist_max': 74},
+        {'size': 'XL', 'bust_max': 96, 'waist_max': 78},
+    ]
+    bottom_chart = [
+        {'size': 'S', 'waist_max': 66, 'hip_max': 90},
+        {'size': 'M', 'waist_max': 70, 'hip_max': 94},
+        {'size': 'L', 'waist_max': 74, 'hip_max': 98},
+        {'size': 'XL', 'waist_max': 78, 'hip_max': 102},
+    ]
+
+    # BMI baseline
+    if height_cm and weight_kg:
+        h_m = height_cm / 100.0
+        bmi = weight_kg / (h_m * h_m)
+        reasons.append(f"BMI≈{bmi:.1f}")
+        if bmi < 18.5:
+            size = 'S'
+        elif bmi < 23:
+            size = 'M'
+        elif bmi < 27.5:
+            size = 'L'
+        else:
+            size = 'XL'
+
+    # Measurement overrides by category
+    cat = (category or '').lower()
+    if cat in ('top', 'dress') and (bust_cm or waist_cm):
+        for row in top_chart:
+            ok_bust = (bust_cm is None) or (bust_cm <= row['bust_max'])
+            ok_waist = (waist_cm is None) or (waist_cm <= row['waist_max'])
+            if ok_bust and ok_waist:
+                size = row['size']
+                reasons.append(f"ngực≤{row['bust_max']}cm, eo≤{row['waist_max']}cm")
+                break
+    if cat in ('bottom',) and (waist_cm or hip_cm):
+        for row in bottom_chart:
+            ok_waist = (waist_cm is None) or (waist_cm <= row['waist_max'])
+            ok_hip = (hip_cm is None) or (hip_cm <= row['hip_max'])
+            if ok_waist and ok_hip:
+                size = row['size']
+                reasons.append(f"eo≤{row['waist_max']}cm, mông≤{row['hip_max']}cm")
+                break
+
+    # Height-based nudge
+    if height_cm:
+        if height_cm < 155 and size in ('M', 'L', 'XL'):
+            reasons.append('thấp, giảm 1 size')
+            size = 'S' if size == 'M' else ('M' if size == 'L' else 'L')
+        if height_cm > 170 and size in ('S', 'M'):
+            reasons.append('cao, tăng 1 size')
+            size = 'M' if size == 'S' else 'L'
+
+    return {
+        'size': size,
+        'notes': ', '.join(reasons) if reasons else 'Dựa trên số đo cung cấp',
+        'inputs': {
+            'height_cm': height_cm,
+            'weight_kg': weight_kg,
+            'bust_cm': bust_cm,
+            'waist_cm': waist_cm,
+            'hip_cm': hip_cm,
+            'category': category,
+            'gender': gender,
+        }
+    }
+
+
+@app.route("/api/recommend_size", methods=["POST"])
+def recommend_size_api():
+    try:
+        data = request.get_json(silent=True) or {}
+        height_raw = data.get('height')
+        weight_raw = data.get('weight')
+        bust = _parse_number(data.get('bust'))
+        waist = _parse_number(data.get('waist'))
+        hip = _parse_number(data.get('hip'))
+        category = data.get('category')  # 'top' | 'bottom' | 'dress'
+        gender = data.get('gender')
+        use_gemini = bool(data.get('use_gemini'))
+
+        height = parse_height_cm(height_raw)
+        weight = parse_weight_kg(weight_raw)
+
+        if use_gemini:
+            try:
+                prompt = (
+                    "Bạn là stylist. Hãy gợi ý size cho phụ nữ (S/M/L/XL) và lý do dựa trên số đo sau\n"
+                    f"Chiều cao: {height_raw}, Cân nặng: {weight_raw}, Ngực: {bust}cm, Eo: {waist}cm, Mông: {hip}cm\n"
+                    f"Danh mục: {category or 'không rõ'}, Giới tính: {gender or 'không rõ'}\n"
+                    "Trả về JSON duy nhất: {\"size\":\"S|M|L|XL\", \"notes\":\"lý do ngắn\"}"
+                )
+                resp = model.generate_content([prompt])
+                text = (resp.text or '').strip()
+                try:
+                    rec = json.loads(text)
+                    if isinstance(rec, dict) and rec.get('size'):
+                        # Normalize size
+                        size = str(rec.get('size')).upper()
+                        if size not in ('S','M','L','XL'):
+                            size = 'M'
+                        return jsonify({
+                            'size': size,
+                            'notes': rec.get('notes') or 'Theo Gemini',
+                            'source': 'gemini'
+                        })
+                except Exception:
+                    pass
+            except Exception as e:
+                print(f"[recommend_size_api] gemini error: {e}")
+                # fall through to heuristics
+
+        result = recommend_size(
+            height_cm=height,
+            weight_kg=weight,
+            bust_cm=bust,
+            waist_cm=waist,
+            hip_cm=hip,
+            category=category,
+            gender=gender,
+        )
+        result['source'] = 'heuristic'
+        return jsonify(result)
+    except Exception as e:
+        print(f"❌ Error /api/recommend_size: {e}")
+        return jsonify({'error': f'Lỗi máy chủ: {str(e)}'}), 500
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
@@ -683,6 +876,7 @@ if __name__ == "__main__":
     # set GEMINI_API_KEY=... && set SUPABASE_URL=... && set SUPABASE_ANON_KEY=... && python app_gemini_product_search.py
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
