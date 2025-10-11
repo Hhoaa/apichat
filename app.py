@@ -5,7 +5,8 @@ import sys
 import json
 import tempfile
 import mimetypes
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple, Optional
+import re
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -49,11 +50,54 @@ def get_mime_type(filename: str) -> str:
     return mtype or "application/octet-stream"
 
 
-EXTRACTION_PROMPT = """Bạn là trợ lý tìm kiếm sản phẩm thời trang. Hãy phân tích ảnh (nếu có) và/hoặc mô tả văn bản để TRẢ VỀ JSON CHUẨN, KHÔNG kèm văn bản khác, theo thứ tự ưu tiên: loại -> màu sắc -> đặc tính.
+# ===================================
+# IMPROVED EXTRACTION PROMPT - WITH SMART PRICE ANALYSIS
+# ===================================
+EXTRACTION_PROMPT = """Bạn là trợ lý thông minh phân tích yêu cầu mua sắm thời trang.
 
-YÊU CẦU JSON (tiếng Việt, không viết hoa toàn bộ):
+NHIỆM VỤ: Phân tích tin nhắn để xác định ý định của người dùng VÀ PHÂN TÍCH GIÁ CHÍNH XÁC.
+
+PHÂN LOẠI Ý ĐỊNH:
+1. "greeting" - Chào hỏi: "xin chào", "hi", "hello", "chào shop"
+2. "general_question" - Hỏi chung: "shop ở đâu", "giao hàng thế nào", "có uy tín không"
+3. "style_advice" - Xin tư vấn: "mặc gì đẹp", "phối đồ thế nào", "hợp với tôi không"
+4. "product_search" - Tìm sản phẩm: "tìm váy", "có áo sơ mi không", "xem quần jean"
+5. "product_question" - Hỏi về sản phẩm cụ thể: "size nào", "còn màu đen không", "giá bao nhiêu"
+
+⚠️ PHÂN TÍCH GIÁ THÔNG MINH (QUAN TRỌNG):
+Khi người dùng nói về giá, hãy PHÂN TÍCH CHÍNH XÁC:
+
+1. **GIÁ TỐI ĐA (max only):**
+   - "300k trở xuống" → min: null, max: 300000
+   - "dưới 500k" → min: null, max: 500000
+   - "không quá 400k" → min: null, max: 400000
+   - "tối đa 300k" → min: null, max: 300000
+
+2. **GIÁ TỐI THIỂU (min only):**
+   - "500k trở lên" → min: 500000, max: null
+   - "trên 300k" → min: 300000, max: null
+   - "ít nhất 400k" → min: 400000, max: null
+
+3. **KHOẢNG GIÁ (range):**
+   - "300k-500k" → min: 300000, max: 500000
+   - "từ 200k đến 400k" → min: 200000, max: 400000
+
+4. **GIÁ KHOẢNG (around ±20%):**
+   - "tầm 300k" → min: 240000, max: 360000
+   - "khoảng 500k" → min: 400000, max: 600000
+
+5. **ĐƠN VỊ:**
+   - "300" hoặc "300k" → 300,000 VNĐ
+   - "1tr" hoặc "1 triệu" → 1,000,000 VNĐ
+
+CHỈ TRÍCH XUẤT thông tin sản phẩm KHI user_intent là "product_search" hoặc "product_question".
+
+TRẢ VỀ JSON:
 {
-  "type": "váy | áo sơ mi | quần jean | chân váy | áo thun | ...",
+  "user_intent": "greeting | general_question | style_advice | product_search | product_question",
+  "confidence": 0.0-1.0,
+  "should_search_products": true/false,
+  "type": "váy | áo | quần | chân váy | áo sơ mi | áo thun | quần jean | đầm | ...",
   "colors": ["đen", "trắng", "xanh navy", ...],
   "material": "cotton | jeans | lụa | len | da | ...",
   "pattern": "trơn | kẻ sọc | caro | hoa | chấm bi | ...",
@@ -61,68 +105,169 @@ YÊU CẦU JSON (tiếng Việt, không viết hoa toàn bộ):
   "length": "ngắn | midi | dài | qua gối | ...",
   "sleeve": "sát nách | ngắn tay | dài tay | ...",
   "fit": "ôm | suông | rộng | ...",
-  "gender": "nữ | nam | unisex | không rõ",
-  "additional_keywords": ["cổ tròn", "cổ bẻ", "cổ V", "xếp ly", ...],
-  "keywords": ["chuỗi tìm kiếm tổng hợp tối đa 8 mục"],
-  "notes": "mô tả ngắn gọn (tùy chọn)"
+  "price_range": {"min": 200000, "max": 500000},
+  "price_analysis": "Giải thích cách bạn phân tích giá",
+  "keywords": ["từ khóa tìm kiếm"],
+  "conversation_context": "phân tích ngắn về ngữ cảnh"
 }
 
-QUY TẮC:
-- Ưu tiên nhận diện loại (type) trước, sau đó là màu sắc (colors), rồi đến material/pattern/style/length/sleeve/fit.
-- Không ghi thương hiệu trừ khi quá rõ.
-- keywords gồm các cụm ngắn gọn ghép từ các trường trên (ví dụ: "váy đen chữ A", "áo sơ mi trắng dài tay"), tối đa 8.
-- Nếu thông tin mơ hồ, điền "không rõ" hoặc mảng rỗng.
+QUY TẮC QUAN TRỌNG:
+- should_search_products = true CHỈ KHI có ý định tìm/mua sản phẩm rõ ràng
+- keywords PHẢI rỗng [] nếu không có ý định tìm sản phẩm
+- keywords KHÔNG BAO GIỜ chứa "không rõ" hoặc giá trị mơ hồ
+- price_range PHẢI chính xác dựa trên ý định người dùng
+- Nếu chỉ chào hỏi: user_intent="greeting", should_search_products=false, keywords=[]
+- Nếu hỏi tư vấn chung: user_intent="style_advice", should_search_products=false
 
-Hãy chỉ trả về JSON hợp lệ duy nhất.
+VÍ DỤ:
+Input: "xin chào"
+Output: {"user_intent": "greeting", "should_search_products": false, "keywords": []}
+
+Input: "tìm váy đen giá 300k trở xuống"
+Output: {"user_intent": "product_search", "should_search_products": true, "type": "váy", "colors": ["đen"], "price_range": {"min": null, "max": 300000}, "price_analysis": "300k trở xuống = tối đa 300k", "keywords": ["váy đen"]}
+
+Input: "váy tầm 300k"
+Output: {"user_intent": "product_search", "should_search_products": true, "type": "váy", "price_range": {"min": 240000, "max": 360000}, "price_analysis": "tầm 300k = khoảng ±20%", "keywords": ["váy"]}
+
+Input: "mặc gì đẹp?"
+Output: {"user_intent": "style_advice", "should_search_products": false, "keywords": []}
 """
 
-CHAT_PROMPT = """Bạn là AI tư vấn thời trang chuyên nghiệp của Zamy Shop. Nhiệm vụ của bạn là:
 
-1. TƯ VẤN THỜI TRANG: Giúp khách hàng chọn trang phục phù hợp dựa trên:
-   - Chiều cao, cân nặng, vóc dáng
-   - Màu sắc yêu thích
-   - Dịp sử dụng (công sở, dạo phố, dự tiệc, thể thao...)
-   - Phong cách cá nhân
-   - Ngân sách
+# ===================================
+# IMPROVED CHAT PROMPT
+# ===================================
+CHAT_PROMPT = """Bạn là Mina - trợ lý thời trang thân thiện, nhiệt tình của Zamy Shop. 
 
-2. PHÂN TÍCH HÌNH ẢNH: Nếu có hình ảnh, phân tích để:
-   - Nhận diện loại trang phục
-   - Xác định màu sắc, chất liệu, phong cách
-   - Gợi ý sản phẩm tương tự
+🎯 TÍNH CÁCH CỦA BẠN:
+- Thân thiện, gần gũi như người bạn (không khách sáo)
+- Nhiệt tình nhưng không áp đặt
+- Tinh tế, hiểu tâm lý phụ nữ
+- Sử dụng emoji tự nhiên (1-2/câu): 😊 💕 ✨ 👗 
+- Đặt câu hỏi mở để hiểu rõ khách hàng
+- Trả lời ngắn gọn, súc tích (2-4 câu)
 
-3. TRẢ LỜI THÂN THIỆN: Sử dụng giọng điệu:
-   - Nhiệt tình, thân thiện
-   - Chuyên nghiệp nhưng gần gũi
-   - Sử dụng emoji phù hợp
-   - Đưa ra lời khuyên cụ thể, thực tế
+👤 THÔNG TIN KHÁCH HÀNG:
+- Tên: {customer_name}
+- Chiều cao: {height} | Cân nặng: {weight}  
+- Màu yêu thích: {favorite_colors}
 
-4. GỢI Ý SẢN PHẨM: 
-   - CHỈ gợi ý sản phẩm có thật trong cửa hàng
-   - KHÔNG được "bịa" hoặc tạo ra sản phẩm không tồn tại
-   - Nếu không tìm thấy sản phẩm phù hợp, hãy thừa nhận và gợi ý sản phẩm tương tự có sẵn
-   - Luôn kết thúc bằng việc gợi ý sản phẩm cụ thể từ shop
+📝 LỊCH SỬ TRÒ CHUYỆN:
+{chat_history}
 
-THÔNG TIN KHÁCH HÀNG:
-- Chiều cao: {height}
-- Cân nặng: {weight}  
-- Màu sắc yêu thích: {favorite_colors}
-- Lịch sử chat: {chat_history}
+🎨 Ý ĐỊNH HIỆN TẠI: {current_intent}
+📦 SẢN PHẨM TÌM ĐƯỢC: {products_found}
 
-QUAN TRỌNG: Bạn CHỈ được gợi ý sản phẩm có thật trong database của shop. Nếu không tìm thấy sản phẩm chính xác, hãy gợi ý sản phẩm tương tự gần nhất có sẵn.
+---
 
-Hãy trả lời ngắn gọn, hữu ích và gợi ý sản phẩm phù hợp."""
+HƯỚNG DẪN TRẢ LỜI THEO TỪNG TÌNH HUỐNG:
+
+1️⃣ CHÀO HỎI LẦN ĐẦU (user_intent = "greeting"):
+✅ Làm:
+- Chào thân mật, ấm áp
+- Giới thiệu ngắn gọn về mình
+- Hỏi tên khách (nếu chưa biết)
+- Hỏi mở: "Hôm nay bạn cần tìm gì?" hoặc "Mình có thể giúp gì cho bạn?"
+
+❌ Không làm:
+- Không liệt kê sản phẩm ngay
+- Không hỏi quá nhiều câu cùng lúc
+- Không dùng ngôn ngữ marketing
+
+Ví dụ tốt:
+"Chào bạn! Mình là Mina, trợ lý thời trang của Zamy Shop đây 😊 Rất vui được hỗ trợ bạn hôm nay! Bạn tên gì nhỉ?"
+
+2️⃣ TƯ VẤN PHONG CÁCH (user_intent = "style_advice"):
+✅ Làm:
+- Đặt câu hỏi để hiểu rõ: dịp gì? phong cách nào?
+- Phân tích dựa trên chiều cao/cân nặng
+- Gợi ý 2-3 style cụ thể với LÝ DO
+- Kết thúc bằng câu hỏi tiếp theo
+
+Ví dụ tốt:
+"Với chiều cao {height} và vóc dáng cân đối của bạn, mình nghĩ bạn sẽ rất hợp với:
+- Váy chữ A midi: tôn dáng và thanh lịch 
+- Quần ống suông + áo croptop: trẻ trung, năng động
+
+Bạn định mặc đi đâu nhỉ? Công sở hay đi chơi?"
+
+3️⃣ TÌM SẢN PHẨM - CÓ KẾT QUẢ (products_found > 0):
+✅ Làm:
+- Xác nhận đã hiểu nhu cầu
+- Thông báo tìm được sản phẩm một cách tự nhiên
+- Nhấn mạnh ưu điểm nổi bật (1-2 điểm)
+- Hỏi xem có cần filter thêm không
+
+❌ Không làm:
+- Không nói "Tuyệt vời! Tôi đã tìm thấy..."
+- Không dùng câu template cứng nhắc
+
+Ví dụ tốt:
+"Mình tìm được mấy em váy đẹp trong tầm giá bạn cần luôn! 😍 Có cả màu đen và trắng, vừa túi tiền mà chất lượng tốt nè.
+
+Bạn thích dáng nào hơn: ôm hay suông?"
+
+4️⃣ TÌM SẢN PHẨM - KHÔNG CÓ KẾT QUẢ (products_found = 0):
+✅ Làm:
+- Thừa nhận thẳng thắn nhưng tích cực
+- Giải thích ngắn gọn (có thể do hết hàng, sắp về...)
+- ĐỀ XUẤT thay thế cụ thể (màu khác, style tương tự...)
+- Hỏi xem có quan tâm đến gợi ý không
+
+Ví dụ tốt:
+"Ôi, váy đen trong mức giá đó hiện tại đang hết hàng rồi bạn ơi 😢 
+
+Nhưng mình có mấy em váy xanh navy cũng đẹp lắm, hoặc váy trắng cũng rất hợp với bạn đó!
+
+Bạn có muốn xem không?"
+
+5️⃣ TRẢ LỜI CÂU HỎI CHUNG (user_intent = "general_question"):
+✅ Làm:
+- Trả lời trực tiếp, ngắn gọn
+- Thêm thông tin hữu ích liên quan
+- Hỏi liệu còn thắc mắc gì không
+
+Ví dụ tốt:
+"Zamy Shop giao hàng toàn quốc trong 2-3 ngày bạn nhé! Freeship cho đơn từ 300k 🚚
+
+Bạn ở tỉnh nào? Mình check giúp thời gian giao cụ thể nha!"
+
+---
+
+⚠️ LƯU Ý QUAN TRỌNG:
+- LUÔN gọi khách hàng là "bạn" (không dùng "chị", "cô", "anh")
+- SỬ DỤNG ngôi "mình" thay vì "tôi" hoặc "em"
+- TRÁNH các cụm từ AI: "Tôi có thể giúp", "Tôi là trợ lý AI"
+- MỖI câu trả lời NÊN có 1 câu hỏi mở ở cuối
+- ĐỌC kỹ lịch sử chat, KHÔNG lặp lại câu hỏi đã hỏi
+- NẾU khách đã cung cấp thông tin, HÃY sử dụng ngay (tên, sở thích...)
+- KHÔNG đề cập "sản phẩm trong database" - nói tự nhiên
+- CHỈ gợi ý sản phẩm CÓ THẬT, không bịa ra
+
+---
+
+HÃY TRẢ LỜI TIN NHẮN SAU ĐÂY:
+User: {user_message}
+"""
 
 
 def extract_keywords_with_gemini(user_message: str, file_path: str | None, mime_type: str | None) -> Dict[str, Any]:
+    """Extract keywords and intent from user message with SMART PRICE DETECTION"""
     try:
         if file_path:
             uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
-            parts = [uploaded_file, user_message or "Hãy trích xuất từ khóa từ ảnh này."]
+            parts = [uploaded_file, user_message or "Hãy phân tích ảnh này."]
         else:
-            parts = [user_message or "Hãy trích xuất từ khóa từ mô tả này."]
+            parts = [user_message or ""]
 
         response = model.generate_content([EXTRACTION_PROMPT, *parts])
         text = (response.text or "").strip()
+        
+        # Remove markdown code blocks if present
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+        text = text.strip()
 
         def try_parse_json(s: str):
             try:
@@ -135,60 +280,78 @@ def extract_keywords_with_gemini(user_message: str, file_path: str | None, mime_
                 raise
 
         data = try_parse_json(text)
+        
+        # Ensure keywords is a list and doesn't contain "không rõ"
         keywords = data.get("keywords", [])
         if not isinstance(keywords, list):
             keywords = []
+        keywords = [k for k in keywords if k and isinstance(k, str) and k.strip() and "không rõ" not in k.lower()]
         
-        if not keywords:
+        # Build keywords from structured data if empty
+        if not keywords and data.get("should_search_products", False):
             type_ = data.get("type") or ""
             colors = data.get("colors") or []
             material = data.get("material") or ""
             pattern = data.get("pattern") or ""
             style = data.get("style") or []
-            length = data.get("length") or ""
-            sleeve = data.get("sleeve") or ""
-            add = data.get("additional_keywords") or []
-
+            
             candidates = []
             base = type_.strip()
             if base:
+                candidates.append(base)
                 if colors:
                     for c in colors[:2]:
                         candidates.append(f"{base} {c}")
-                if sleeve:
-                    candidates.append(f"{base} {sleeve}")
-                if length:
-                    candidates.append(f"{base} {length}")
-                if pattern:
+                if pattern and pattern != "không rõ":
                     candidates.append(f"{base} {pattern}")
-                if material:
+                if material and material != "không rõ":
                     candidates.append(f"{base} {material}")
-                for s in (style if isinstance(style, list) else [style]):
-                    if s:
-                        candidates.append(f"{base} {s}")
-            for a in add[:3]:
-                if base:
-                    candidates.append(f"{base} {a}")
-                else:
-                    candidates.append(a)
-
-            keywords = candidates
-
-        keywords = list(dict.fromkeys([k.strip() for k in keywords if isinstance(k, str) and k.strip()]))
-        keywords = keywords[:8]
+            
+            keywords = candidates[:6]
+        
+        # Remove duplicates while preserving order
+        keywords = list(dict.fromkeys([k.strip() for k in keywords if k.strip()]))[:8]
+        
+        # Extract price range from AI analysis
+        price_range = data.get("price_range", {})
+        min_price = price_range.get("min") if isinstance(price_range, dict) else None
+        max_price = price_range.get("max") if isinstance(price_range, dict) else None
+        price_analysis = data.get("price_analysis", "")
         
         out = {
             "keywords": keywords,
-            "notes": data.get("notes", ""),
+            "user_intent": data.get("user_intent", "general_question"),
+            "should_search_products": data.get("should_search_products", False),
+            "confidence": data.get("confidence", 0.5),
+            "conversation_context": data.get("conversation_context", ""),
+            "price_min": min_price,
+            "price_max": max_price,
+            "price_analysis": price_analysis,
         }
-        for k in ["type","colors","material","pattern","style","length","sleeve","fit","gender","additional_keywords"]:
+        
+        # Copy other fields
+        for k in ["type","colors","material","pattern","style","length","sleeve","fit"]:
             if k in data:
                 out[k] = data[k]
+        
+        print(f"🔍 [EXTRACTION] Intent: {out['user_intent']}, Should search: {out['should_search_products']}, Keywords: {keywords}")
+        print(f"💰 [PRICE AI] Min: {min_price}, Max: {max_price} - {price_analysis}")
+        
         return out
+        
     except Exception as e:
         print(f"[extract_keywords_with_gemini] error: {e}")
-        fallback = [t.strip() for t in (user_message or "").split() if len(t.strip()) > 1][:6]
-        return {"keywords": fallback, "notes": "fallback"}
+        # Safe fallback
+        return {
+            "keywords": [],
+            "user_intent": "general_question",
+            "should_search_products": False,
+            "confidence": 0.0,
+            "conversation_context": "Lỗi phân tích",
+            "price_min": None,
+            "price_max": None,
+            "price_analysis": ""
+        }
 
 
 def build_or_clause_for_keywords(columns: List[str], keywords: List[str]) -> str:
@@ -209,106 +372,6 @@ def score_product(product: Dict[str, Any], keywords: List[str]) -> int:
     return cnt
 
 
-def calculate_similarity(text1: str, text2: str) -> float:
-    if not text1 or not text2:
-        return 0.0
-    
-    text1 = text1.lower().strip()
-    text2 = text2.lower().strip()
-    
-    if text1 == text2:
-        return 1.0
-    
-    common_chars = 0
-    max_len = max(len(text1), len(text2))
-    
-    for char in text1:
-        if char in text2:
-            common_chars += 1
-    
-    return common_chars / max_len if max_len > 0 else 0.0
-
-
-def find_similar_products(products: List[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
-    if not products or not keywords:
-        return []
-    
-    similar_products = []
-    min_similarity = 0.3
-    
-    for product in products:
-        product_name = product.get("ten_san_pham", "")
-        if not product_name:
-            continue
-            
-        max_similarity = 0.0
-        best_match_keyword = ""
-        
-        for keyword in keywords:
-            similarity = calculate_similarity(product_name, keyword)
-            if similarity > max_similarity:
-                max_similarity = similarity
-                best_match_keyword = keyword
-        
-        if max_similarity >= min_similarity:
-            product_with_score = product.copy()
-            product_with_score["_similarity_score"] = max_similarity
-            product_with_score["_matched_keyword"] = best_match_keyword
-            similar_products.append(product_with_score)
-            print(f"🔍 [SIMILARITY] '{product_name}' matches '{best_match_keyword}' with {max_similarity:.2f} similarity")
-    
-    similar_products.sort(key=lambda x: x.get("_similarity_score", 0), reverse=True)
-    
-    for product in similar_products:
-        product.pop("_similarity_score", None)
-        product.pop("_matched_keyword", None)
-    
-    return similar_products
-
-
-def find_partial_matches(products: List[Dict[str, Any]], keywords: List[str]) -> List[Dict[str, Any]]:
-    if not products or not keywords:
-        return []
-    
-    partial_matches = []
-    
-    for product in products:
-        product_name = product.get("ten_san_pham", "").lower()
-        product_desc = product.get("mo_ta_san_pham", "").lower()
-        
-        match_score = 0
-        matched_keywords = []
-        
-        for keyword in keywords:
-            keyword_lower = keyword.lower()
-            
-            if keyword_lower in product_name:
-                match_score += 3
-                matched_keywords.append(keyword)
-            elif any(word in product_name for word in keyword_lower.split()):
-                match_score += 2
-                matched_keywords.append(keyword)
-            elif keyword_lower in product_desc:
-                match_score += 1
-                matched_keywords.append(keyword)
-        
-        if match_score > 0:
-            product_with_score = product.copy()
-            product_with_score["_match_score"] = match_score
-            product_with_score["_matched_keywords"] = matched_keywords
-            partial_matches.append(product_with_score)
-            print(f"🔍 [PARTIAL] '{product.get('ten_san_pham', '')}' matches keywords: {matched_keywords} (score: {match_score})")
-    
-    partial_matches.sort(key=lambda x: x.get("_match_score", 0), reverse=True)
-    
-    for product in partial_matches:
-        product.pop("_match_score", None)
-        product.pop("_matched_keywords", None)
-    
-    return partial_matches
-
-
-# SỬA: Hàm map_product_row - ma_san_pham giờ là INTEGER
 def map_product_row(row: Dict[str, Any]) -> Dict[str, Any]:
     images = []
     if isinstance(row.get("product_images"), list):
@@ -318,7 +381,7 @@ def map_product_row(row: Dict[str, Any]) -> Dict[str, Any]:
                 images.append(url)
 
     return {
-        "id": int(row.get("ma_san_pham")) if row.get("ma_san_pham") else None,  # SỬA: Đảm bảo là INTEGER
+        "id": int(row.get("ma_san_pham")) if row.get("ma_san_pham") else None,
         "name": row.get("ten_san_pham"),
         "description": row.get("mo_ta_san_pham"),
         "price": float(row.get("gia_ban") or 0.0),
@@ -358,35 +421,59 @@ def search_products():
 
         extracted = extract_keywords_with_gemini(user_message, file_path, mime_type)
         keywords: List[str] = extracted.get("keywords", [])[:6]
-
-        token_set = []
-        for kw in keywords:
-            token_set.append(kw)
-            for t in kw.replace(",", " ").split():
-                t = t.strip()
-                if len(t) > 1 and t.lower() not in [x.lower() for x in token_set]:
-                    token_set.append(t)
-        keywords = token_set[:10]
-
+        
+        # Clean up temp file
         if file_path and os.path.exists(file_path):
             try:
                 os.unlink(file_path)
             except Exception:
                 pass
 
-        if not keywords:
-            return jsonify({"keywords": [], "products": [], "notes": extracted.get("notes", "")})
+        # If no product search intent, return empty
+        if not extracted.get("should_search_products", False) or not keywords:
+            return jsonify({
+                "keywords": keywords,
+                "products": [],
+                "user_intent": extracted.get("user_intent"),
+                "notes": extracted.get("conversation_context", "")
+            })
 
+        # Get price from AI analysis
+        min_price = extracted.get("price_min")
+        max_price = extracted.get("price_max")
+        det_type = (extracted.get("type") or "").strip().lower() or None
+        det_colors = [c.strip().lower() for c in (extracted.get("colors") or []) if isinstance(c, str) and c.strip()]
+
+        # Build search query
         columns = ["ten_san_pham", "mo_ta_san_pham"]
         or_clause = build_or_clause_for_keywords(columns, keywords)
+        
         q = supabase.table("products").select(
             "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
         )
+        
+        # Apply filters
+        if min_price is not None:
+            q = q.gte("gia_ban", min_price)
+            print(f"💰 [FILTER] Min price: {min_price}")
+        if max_price is not None:
+            q = q.lte("gia_ban", max_price)
+            print(f"💰 [FILTER] Max price: {max_price}")
+        if det_type:
+            type_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], [det_type])
+            if type_clause:
+                q = q.or_(type_clause)
+        if det_colors:
+            color_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], det_colors[:2])
+            if color_clause:
+                q = q.or_(color_clause)
         if or_clause:
             q = q.or_(or_clause)
+        
         resp = q.limit(20).execute()
         rows = resp.data or []
 
+        # Fallback search if no results
         if not rows and keywords:
             single_tokens = [t for t in keywords if len(t.split()) == 1]
             if single_tokens:
@@ -394,17 +481,40 @@ def search_products():
                 q2 = supabase.table("products").select(
                     "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
                 )
+                if min_price is not None:
+                    q2 = q2.gte("gia_ban", min_price)
+                if max_price is not None:
+                    q2 = q2.lte("gia_ban", max_price)
                 if or_clause_2:
                     q2 = q2.or_(or_clause_2)
                 resp2 = q2.limit(20).execute()
                 rows = resp2.data or []
         
-        rows_sorted = sorted(rows, key=lambda r: score_product(r, keywords), reverse=True)
+        # Sort by relevance
+        def rank_row(r: Dict[str, Any]) -> tuple:
+            name = (r.get("ten_san_pham") or "").lower()
+            desc = (r.get("mo_ta_san_pham") or "").lower()
+            txt = name + " " + desc
+            score = score_product(r, keywords)
+            type_bonus = 3 if det_type and det_type in txt else 0
+            color_bonus = 0
+            if det_colors:
+                color_bonus = sum(1 for c in det_colors if c in txt)
+            price_penalty = 0
+            price = float(r.get("gia_ban") or 0)
+            if min_price is not None or max_price is not None:
+                center = ((min_price or price) + (max_price or price)) / 2.0
+                price_penalty = abs(price - center) / max(center, 1.0)
+            return (score + type_bonus + color_bonus, -price_penalty)
+
+        rows_sorted = sorted(rows, key=lambda r: rank_row(r), reverse=True)
         products = [map_product_row(r) for r in rows_sorted]
 
         return jsonify({
             "keywords": keywords,
-            "notes": extracted.get("notes", ""),
+            "user_intent": extracted.get("user_intent"),
+            "notes": extracted.get("conversation_context", ""),
+            "price_analysis": extracted.get("price_analysis", ""),
             "count": len(products),
             "products": products
         })
@@ -414,178 +524,190 @@ def search_products():
         return jsonify({"error": f"Lỗi máy chủ: {str(e)}"}), 500
 
 
-def generate_ai_response(user_message: str, chat_history: List[Dict], user_profile: Dict, file_path: str | None = None, mime_type: str | None = None) -> Dict[str, Any]:
-    """Generate AI response for chat"""
+def generate_ai_response(
+    user_message: str,
+    chat_history: List[Dict],
+    user_profile: Dict,
+    file_path: str | None = None,
+    mime_type: str | None = None,
+) -> Dict[str, Any]:
+    """Generate AI response for chat with improved natural conversation"""
     try:
-        # Build context from user profile and chat history
-        height = user_profile.get('height', 'không rõ')
-        weight = user_profile.get('weight', 'không rõ')
-        favorite_colors = user_profile.get('favorite_colors', [])
+        # Extract user info with safe defaults
+        customer_name = user_profile.get('name', 'bạn') if user_profile else 'bạn'
+        height = user_profile.get('height', 'chưa rõ') if user_profile else 'chưa rõ'
+        weight = user_profile.get('weight', 'chưa rõ') if user_profile else 'chưa rõ'
+        favorite_colors = user_profile.get('favorite_colors', []) if user_profile else []
+        
         if isinstance(favorite_colors, list):
-            favorite_colors_str = ', '.join(favorite_colors)
+            favorite_colors_str = ', '.join(favorite_colors) if favorite_colors else 'chưa rõ'
         else:
-            favorite_colors_str = str(favorite_colors)
+            favorite_colors_str = str(favorite_colors) if favorite_colors else 'chưa rõ'
         
-        # Build chat history context
+        # Build chat history context (last 5 messages) - SAFE VERSION
         chat_context = []
-        for msg in chat_history[-5:]:  # Last 5 messages for context
-            if msg.get('type') == 'user':
-                chat_context.append(f"Khách hàng: {msg.get('message', '')}")
+        if chat_history and isinstance(chat_history, list):
+            for msg in chat_history[-5:]:
+                try:
+                    if not isinstance(msg, dict):
+                        continue
+                    
+                    # Handle different message format possibilities
+                    msg_type = msg.get('type', '') or msg.get('role', '') or msg.get('sender', '')
+                    message = msg.get('message', '') or msg.get('content', '') or msg.get('text', '')
+                    
+                    # Determine role
+                    if msg_type.lower() in ('user', 'human', 'customer'):
+                        role = "Khách hàng"
+                    elif msg_type.lower() in ('ai', 'assistant', 'bot', 'mina'):
+                        role = "Mina"
+                    else:
+                        # Default based on message content or position
+                        role = "Khách hàng"
+                    
+                    if message and isinstance(message, str) and message.strip():
+                        chat_context.append(f"{role}: {message.strip()}")
+                except Exception as msg_error:
+                    print(f"⚠️ [Chat History] Error processing message: {msg_error}")
+                    continue
         
-        chat_history_str = '\n'.join(chat_context) if chat_context else "Chưa có lịch sử chat"
+        chat_history_str = '\n'.join(chat_context) if chat_context else "Chưa có lịch sử"
         
-        # Format the chat prompt
-        formatted_prompt = CHAT_PROMPT.format(
-            height=height,
-            weight=weight,
-            favorite_colors=favorite_colors_str,
-            chat_history=chat_history_str
-        )
-        
-        # Prepare content for Gemini
-        if file_path:
-            uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
-            parts = [uploaded_file, f"{formatted_prompt}\n\nTin nhắn khách hàng: {user_message}"]
-        else:
-            parts = [f"{formatted_prompt}\n\nTin nhắn khách hàng: {user_message}"]
-        
-        # Extract keywords for product search first
+        # Extract keywords and intent first
         extracted = extract_keywords_with_gemini(user_message, file_path, mime_type)
         keywords = extracted.get("keywords", [])[:6]
+        user_intent = extracted.get("user_intent", "general_question")
+        should_search = extracted.get("should_search_products", False)
         
-        # Generate AI response after we know the search results
-        response = model.generate_content(parts)
-        ai_message = (response.text or "").strip()
+        print(f"🤖 [AI] Intent: {user_intent}, Should search: {should_search}")
         
-        # Search for products based on keywords
+        # Search for products if needed
         suggested_products = []
-        if keywords:
-            print(f"🔍 [DEBUG] Searching with keywords: {keywords}")
+        if should_search and keywords:
+            print(f"🔍 [SEARCH] Keywords: {keywords}")
             
-            # First, try exact keyword search
+            # Get price from AI analysis
+            min_price = extracted.get("price_min")
+            max_price = extracted.get("price_max")
+            det_type = (extracted.get("type") or "").strip().lower()
+            det_colors = [c.strip().lower() for c in (extracted.get("colors") or []) if isinstance(c, str) and c.strip()]
+            
+            # Build query
             columns = ["ten_san_pham", "mo_ta_san_pham"]
             or_clause = build_or_clause_for_keywords(columns, keywords)
-            print(f"🔍 [DEBUG] OR clause: {or_clause}")
             
             q = supabase.table("products").select(
                 "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
             )
+            
+            if min_price is not None:
+                q = q.gte("gia_ban", min_price)
+                print(f"💰 [FILTER] Min price: {min_price}")
+            if max_price is not None:
+                q = q.lte("gia_ban", max_price)
+                print(f"💰 [FILTER] Max price: {max_price}")
+            if det_type:
+                type_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], [det_type])
+                if type_clause:
+                    q = q.or_(type_clause)
+            if det_colors:
+                color_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], det_colors[:2])
+                if color_clause:
+                    q = q.or_(color_clause)
             if or_clause:
                 q = q.or_(or_clause)
-            resp = q.limit(6).execute()
+            
+            resp = q.limit(8).execute()
             rows = resp.data or []
-            print(f"🔍 [DEBUG] Found {len(rows)} products with multi-keyword search")
             
-            # If no results, try with main keywords immediately
-            if not rows:
-                print("🔍 [DEBUG] Trying main keywords search immediately...")
-                main_keywords = []
-                for keyword in keywords:
-                    words = keyword.split()
-                    for word in words:
-                        if len(word) > 2:
-                            main_keywords.append(word)
-                
-                if main_keywords:
-                    print(f"🔍 [DEBUG] Main keywords: {main_keywords}")
-                    main_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], main_keywords)
-                    if main_clause:
-                        q_main = supabase.table("products").select(
-                            "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
-                        ).or_(main_clause).limit(6).execute()
-                        rows = q_main.data or []
-                        print(f"🔍 [DEBUG] Found {len(rows)} products with main keywords")
-                        
-                        # If found products with main keywords, update AI message
-                        if rows:
-                            ai_message += f"\n\nTôi tìm thấy 1 số sản phẩm '{', '.join(keywords)}' nhưng đã tìm thấy một số sản phẩm liên quan dựa trên từ khóa chính: {', '.join(main_keywords)} 😊"
-            
-            # Fallback search with single tokens
-            if not rows:
-                single_tokens = [t for t in keywords if len(t.split()) == 1]
-                print(f"🔍 [DEBUG] Trying single tokens: {single_tokens}")
+            # Fallback search
+            if not rows and keywords:
+                single_tokens = [t for t in keywords if len(t.split()) == 1 and len(t) > 2]
                 if single_tokens:
                     or_clause_2 = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], single_tokens)
                     q2 = supabase.table("products").select(
                         "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
                     )
+                    if min_price is not None:
+                        q2 = q2.gte("gia_ban", min_price)
+                    if max_price is not None:
+                        q2 = q2.lte("gia_ban", max_price)
                     if or_clause_2:
                         q2 = q2.or_(or_clause_2)
-                    resp2 = q2.limit(6).execute()
+                    resp2 = q2.limit(8).execute()
                     rows = resp2.data or []
-                    print(f"🔍 [DEBUG] Found {len(rows)} products with single-token search")
-            
-            # If still no results, try broader search
-            if not rows:
-                print("🔍 [DEBUG] Trying broader search...")
-                # Search for any product containing any keyword
-                broader_keywords = [k for k in keywords if len(k) > 2]  # Only longer keywords
-                if broader_keywords:
-                    broader_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], broader_keywords)
-                    q3 = supabase.table("products").select(
-                        "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
-                    )
-                    if broader_clause:
-                        q3 = q3.or_(broader_clause)
-                    resp3 = q3.limit(6).execute()
-                    rows = resp3.data or []
-                    print(f"🔍 [DEBUG] Found {len(rows)} products with broader search")
-            
-            # If still no results, try fuzzy/similarity search
-            if not rows:
-                print("🔍 [DEBUG] Trying fuzzy/similarity search...")
-                # Get all products and find similar ones
-                all_products_resp = supabase.table("products").select(
-                    "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
-                ).limit(100).execute()  # Get more products for better matching
-                all_products = all_products_resp.data or []
-                
-                if all_products:
-                    # Find products with similar names
-                    similar_products = find_similar_products(all_products, keywords)
-                    rows = similar_products[:6]  # Limit to 6 results
-                    print(f"🔍 [DEBUG] Found {len(rows)} products with similarity search")
-                    
-                    # If still no results, try partial keyword matching
-                    if not rows:
-                        print("🔍 [DEBUG] Trying partial keyword matching...")
-                        partial_products = find_partial_matches(all_products, keywords)
-                        rows = partial_products[:6]
-                        print(f"🔍 [DEBUG] Found {len(rows)} products with partial matching")
             
             # Sort by relevance
-            rows_sorted = sorted(rows, key=lambda r: score_product(r, keywords), reverse=True)
-            suggested_products = [map_product_row(r) for r in rows_sorted]
-            print(f"🔍 [DEBUG] Final suggested products: {len(suggested_products)}")
+            def rank_row(r: Dict[str, Any]) -> tuple:
+                name = (r.get("ten_san_pham") or "").lower()
+                desc = (r.get("mo_ta_san_pham") or "").lower()
+                txt = name + " " + desc
+                score = score_product(r, keywords)
+                type_bonus = 3 if det_type and det_type in txt else 0
+                color_bonus = sum(1 for c in det_colors if c in txt) if det_colors else 0
+                price_penalty = 0
+                price = float(r.get("gia_ban") or 0)
+                if min_price is not None or max_price is not None:
+                    center = ((min_price or price) + (max_price or price)) / 2.0
+                    price_penalty = abs(price - center) / max(center, 1.0)
+                return (score + type_bonus + color_bonus, -price_penalty)
+
+            rows_sorted = sorted(rows, key=lambda r: rank_row(r), reverse=True)
+            suggested_products = [map_product_row(r) for r in rows_sorted[:6]]
             
-            # Log product names for debugging
-            for i, product in enumerate(suggested_products):
-                print(f"🔍 [DEBUG] Product {i+1}: {product.get('name', 'Unknown')}")
+            print(f"🔍 [SEARCH] Found {len(suggested_products)} products")
         
-        # Update AI message based on search results
-        if suggested_products:
-            # If products found, update AI message to be more positive
-            product_names = [p.get('name', 'Sản phẩm') for p in suggested_products[:3]]
-            
-            # Simple positive response when products are found
-            ai_message = f"Tuyệt vời! Tôi đã tìm thấy một số sản phẩm phù hợp với yêu cầu của bạn. Dưới đây là các sản phẩm gợi ý cho bạn! 😊"
-        elif keywords:
-            # If no products found, suggest alternatives
-            ai_message = f"Hiện tại shop chưa có sản phẩm phù hợp với yêu cầu của bạn. Bạn có thể thử tìm kiếm với từ khóa khác hoặc xem các sản phẩm có sẵn nhé! 😊"
+        # Format the chat prompt with context
+        formatted_prompt = CHAT_PROMPT.format(
+            customer_name=customer_name,
+            height=height,
+            weight=weight,
+            favorite_colors=favorite_colors_str,
+            chat_history=chat_history_str,
+            current_intent=user_intent,
+            products_found=len(suggested_products),
+            user_message=user_message
+        )
+        
+        # Prepare content for Gemini
+        if file_path:
+            uploaded_file = genai.upload_file(file_path, mime_type=mime_type)
+            parts = [uploaded_file, formatted_prompt]
+        else:
+            parts = [formatted_prompt]
+        
+        # Generate AI response
+        response = model.generate_content(parts)
+        ai_message = (response.text or "").strip()
+        
+        # Ensure natural response
+        if not ai_message:
+            if user_intent == "greeting":
+                ai_message = f"Chào {customer_name}! Mình là Mina đây 😊 Hôm nay mình có thể giúp gì cho bạn?"
+            elif user_intent == "product_search" and suggested_products:
+                ai_message = f"Mình tìm được {len(suggested_products)} sản phẩm phù hợp cho bạn! Xem thử nhé 😍"
+            elif user_intent == "product_search" and not suggested_products:
+                ai_message = "Úi, mình chưa tìm thấy sản phẩm phù hợp. Bạn có thể mô tả rõ hơn được không?"
+            else:
+                ai_message = "Mình đang sẵn sàng tư vấn cho bạn! Bạn muốn hỏi gì nào? 😊"
         
         return {
             "ai_message": ai_message,
             "suggested_products": suggested_products,
             "keywords": keywords,
-            "notes": extracted.get("notes", "")
+            "user_intent": user_intent,
+            "notes": extracted.get("conversation_context", "")
         }
         
     except Exception as e:
         print(f"[generate_ai_response] error: {e}")
+        import traceback
+        traceback.print_exc()
         return {
-            "ai_message": "Xin lỗi, tôi gặp sự cố kỹ thuật. Vui lòng thử lại sau.",
+            "ai_message": "Ôi, mình gặp chút vấn đề kỹ thuật. Bạn thử lại sau nhé! 😅",
             "suggested_products": [],
             "keywords": [],
+            "user_intent": "error",
             "notes": "Lỗi hệ thống"
         }
 
@@ -601,12 +723,13 @@ def chat():
         if not user_message:
             return jsonify({"error": "Tin nhắn không được để trống"}), 400
         
-        print(f"🤖 [Chat] User message: {user_message}")
-        print(f"🤖 [Chat] Chat history length: {len(chat_history)}")
-        print(f"🤖 [Chat] User profile: {user_profile}")
+        print(f"💬 [Chat] User: {user_message}")
+        print(f"💬 [Chat] History: {len(chat_history)} messages")
         
         # Generate AI response
-        result = generate_ai_response(user_message, chat_history, user_profile)
+        result = generate_ai_response(
+            user_message, chat_history, user_profile, None, None
+        )
         
         return jsonify(result)
         
@@ -654,8 +777,7 @@ def chat_with_image():
                 file.save(tmp.name)
                 file_path = tmp.name
         
-        print(f"🤖 [Chat Image] User message: {user_message}")
-        print(f"🤖 [Chat Image] Has image: {file_path is not None}")
+        print(f"📸 [Chat Image] User: {user_message}, Has image: {file_path is not None}")
         
         # Generate AI response with image
         result = generate_ai_response(user_message, chat_history, user_profile, file_path, mime_type)
@@ -693,7 +815,6 @@ def _parse_number(s: Any) -> float | None:
         s = s.strip()
         if not s:
             return None
-        # If looks like meters (e.g., 1.65), convert to cm later by caller
         return float(s)
     except Exception:
         return None
@@ -703,10 +824,8 @@ def parse_height_cm(height: Any) -> float | None:
     h = _parse_number(height)
     if h is None:
         return None
-    # If clearly meters (e.g., 1.5 to 2.5), convert to cm
     if 1.3 <= h <= 2.3:
         return h * 100.0
-    # If looks like centimeters
     if 130 <= h <= 230:
         return float(h)
     return None
@@ -716,7 +835,6 @@ def parse_weight_kg(weight: Any) -> float | None:
     w = _parse_number(weight)
     if w is None:
         return None
-    # reasonable human weights
     if 30 <= w <= 200:
         return float(w)
     return None
@@ -729,14 +847,13 @@ def recommend_size(
     bust_cm: float | None = None,
     waist_cm: float | None = None,
     hip_cm: float | None = None,
-    category: str | None = None,  # 'top' | 'bottom' | 'dress' | None
+    category: str | None = None,
     gender: str | None = None,
 ) -> dict:
-    """Heuristic size recommendation. Returns dict with size, range, reasoning."""
+    """Heuristic size recommendation"""
     size = 'M'
     reasons: list[str] = []
 
-    # Fallback charts (VN female general). Adjust as needed.
     top_chart = [
         {'size': 'S', 'bust_max': 84, 'waist_max': 66},
         {'size': 'M', 'bust_max': 88, 'waist_max': 70},
@@ -750,7 +867,6 @@ def recommend_size(
         {'size': 'XL', 'waist_max': 78, 'hip_max': 102},
     ]
 
-    # BMI baseline
     if height_cm and weight_kg:
         h_m = height_cm / 100.0
         bmi = weight_kg / (h_m * h_m)
@@ -764,7 +880,6 @@ def recommend_size(
         else:
             size = 'XL'
 
-    # Measurement overrides by category
     cat = (category or '').lower()
     if cat in ('top', 'dress') and (bust_cm or waist_cm):
         for row in top_chart:
@@ -783,7 +898,6 @@ def recommend_size(
                 reasons.append(f"eo≤{row['waist_max']}cm, mông≤{row['hip_max']}cm")
                 break
 
-    # Height-based nudge
     if height_cm:
         if height_cm < 155 and size in ('M', 'L', 'XL'):
             reasons.append('thấp, giảm 1 size')
@@ -816,7 +930,7 @@ def recommend_size_api():
         bust = _parse_number(data.get('bust'))
         waist = _parse_number(data.get('waist'))
         hip = _parse_number(data.get('hip'))
-        category = data.get('category')  # 'top' | 'bottom' | 'dress'
+        category = data.get('category')
         gender = data.get('gender')
         use_gemini = bool(data.get('use_gemini'))
 
@@ -836,7 +950,6 @@ def recommend_size_api():
                 try:
                     rec = json.loads(text)
                     if isinstance(rec, dict) and rec.get('size'):
-                        # Normalize size
                         size = str(rec.get('size')).upper()
                         if size not in ('S','M','L','XL'):
                             size = 'M'
@@ -849,7 +962,6 @@ def recommend_size_api():
                     pass
             except Exception as e:
                 print(f"[recommend_size_api] gemini error: {e}")
-                # fall through to heuristics
 
         result = recommend_size(
             height_cm=height,
@@ -872,10 +984,12 @@ def health():
     return jsonify({"ok": True})
 
 
+
 if __name__ == "__main__":
     # set GEMINI_API_KEY=... && set SUPABASE_URL=... && set SUPABASE_ANON_KEY=... && python app_gemini_product_search.py
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
