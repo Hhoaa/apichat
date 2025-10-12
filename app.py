@@ -208,18 +208,25 @@ Ví dụ tốt:
 Bạn thích dáng nào hơn: ôm hay suông?"
 
 4️⃣ TÌM SẢN PHẨM - KHÔNG CÓ KẾT QUẢ (products_found = 0):
-✅ Làm:
-- Thừa nhận thẳng thắn nhưng tích cực
-- Giải thích ngắn gọn (có thể do hết hàng, sắp về...)
-- ĐỀ XUẤT thay thế cụ thể (màu khác, style tương tự...)
-- Hỏi xem có quan tâm đến gợi ý không
+❌ TUYỆT ĐỐI KHÔNG ĐƯỢC:
+- Hỏi thêm thông tin hoặc yêu cầu làm rõ
+- Nói "hiện tại không có" rồi dừng lại
+- Chỉ xin lỗi mà không đưa ra giải pháp
+
+✅ BẮT BUỘC PHẢI LÀM:
+- Giải thích ngắn gọn tại sao không tìm thấy (hết hàng, giá không phù hợp...)
+- NGAY LẬP TỨC đề xuất 2-3 sản phẩm thay thế cụ thể
+- Nhấn mạnh ưu điểm của sản phẩm thay thế
+- Hỏi xem khách có muốn xem không (câu đóng, dễ trả lời)
 
 Ví dụ tốt:
-"Ôi, váy đen trong mức giá đó hiện tại đang hết hàng rồi bạn ơi 😢 
+"Váy đen ôm body giá dưới 300k hiện tại đang hết hàng rồi bạn ơi 😢 
 
-Nhưng mình có mấy em váy xanh navy cũng đẹp lắm, hoặc váy trắng cũng rất hợp với bạn đó!
+Nhưng mình có mấy lựa chọn tương tự cũng đẹp lắm nè:
+- Váy xanh navy ôm dáng: thanh lịch, giá 280k
+- Váy đen suông: dễ mặc hơn, 250k
 
-Bạn có muốn xem không?"
+Bạn muốn xem không? 😊"
 
 5️⃣ TRẢ LỜI CÂU HỎI CHUNG (user_intent = "general_question"):
 ✅ Làm:
@@ -243,6 +250,8 @@ Bạn ở tỉnh nào? Mình check giúp thời gian giao cụ thể nha!"
 - NẾU khách đã cung cấp thông tin, HÃY sử dụng ngay (tên, sở thích...)
 - KHÔNG đề cập "sản phẩm trong database" - nói tự nhiên
 - CHỈ gợi ý sản phẩm CÓ THẬT, không bịa ra
+- 🚨 TUYỆT ĐỐI KHÔNG BỊA GIÁ - Chỉ dùng giá từ danh sách sản phẩm được cung cấp
+- 🚨 KHI nói về giá, PHẢI dùng CHÍNH XÁC số tiền từ thông tin sản phẩm, KHÔNG làm tròn
 
 ---
 
@@ -531,7 +540,7 @@ def generate_ai_response(
     file_path: str | None = None,
     mime_type: str | None = None,
 ) -> Dict[str, Any]:
-    """Generate AI response for chat with improved natural conversation"""
+    """Generate AI response for chat with improved natural conversation and ALWAYS show products"""
     try:
         # Extract user info with safe defaults
         customer_name = user_profile.get('name', 'bạn') if user_profile else 'bạn'
@@ -544,7 +553,7 @@ def generate_ai_response(
         else:
             favorite_colors_str = str(favorite_colors) if favorite_colors else 'chưa rõ'
         
-        # Build chat history context (last 5 messages) - SAFE VERSION
+        # Build chat history context (last 5 messages)
         chat_context = []
         if chat_history and isinstance(chat_history, list):
             for msg in chat_history[-5:]:
@@ -552,17 +561,14 @@ def generate_ai_response(
                     if not isinstance(msg, dict):
                         continue
                     
-                    # Handle different message format possibilities
                     msg_type = msg.get('type', '') or msg.get('role', '') or msg.get('sender', '')
                     message = msg.get('message', '') or msg.get('content', '') or msg.get('text', '')
                     
-                    # Determine role
                     if msg_type.lower() in ('user', 'human', 'customer'):
                         role = "Khách hàng"
                     elif msg_type.lower() in ('ai', 'assistant', 'bot', 'mina'):
                         role = "Mina"
                     else:
-                        # Default based on message content or position
                         role = "Khách hàng"
                     
                     if message and isinstance(message, str) and message.strip():
@@ -583,6 +589,8 @@ def generate_ai_response(
         
         # Search for products if needed
         suggested_products = []
+        search_fallback_level = 0
+        
         if should_search and keywords:
             print(f"🔍 [SEARCH] Keywords: {keywords}")
             
@@ -620,8 +628,10 @@ def generate_ai_response(
             resp = q.limit(8).execute()
             rows = resp.data or []
             
-            # Fallback search
+            # FALLBACK LEVEL 1: Single tokens
             if not rows and keywords:
+                search_fallback_level = 1
+                print(f"🔄 [FALLBACK 1] Trying with single tokens")
                 single_tokens = [t for t in keywords if len(t.split()) == 1 and len(t) > 2]
                 if single_tokens:
                     or_clause_2 = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], single_tokens)
@@ -636,6 +646,44 @@ def generate_ai_response(
                         q2 = q2.or_(or_clause_2)
                     resp2 = q2.limit(8).execute()
                     rows = resp2.data or []
+            
+            # FALLBACK LEVEL 2: Remove price constraints
+            if not rows and (min_price is not None or max_price is not None):
+                search_fallback_level = 2
+                print(f"🔄 [FALLBACK 2] Removing price constraints")
+                q3 = supabase.table("products").select(
+                    "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
+                )
+                if or_clause:
+                    q3 = q3.or_(or_clause)
+                if det_type:
+                    type_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], [det_type])
+                    if type_clause:
+                        q3 = q3.or_(type_clause)
+                resp3 = q3.limit(8).execute()
+                rows = resp3.data or []
+            
+            # FALLBACK LEVEL 3: Products by type only
+            if not rows and det_type:
+                search_fallback_level = 3
+                print(f"🔄 [FALLBACK 3] Getting products by type: {det_type}")
+                type_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], [det_type])
+                if type_clause:
+                    q4 = supabase.table("products").select(
+                        "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
+                    ).or_(type_clause).limit(8)
+                    resp4 = q4.execute()
+                    rows = resp4.data or []
+            
+            # FALLBACK LEVEL 4: ANY products (last resort)
+            if not rows:
+                search_fallback_level = 4
+                print(f"🔄 [FALLBACK 4] Getting random popular products")
+                q5 = supabase.table("products").select(
+                    "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
+                ).limit(8)
+                resp5 = q5.execute()
+                rows = resp5.data or []
             
             # Sort by relevance
             def rank_row(r: Dict[str, Any]) -> tuple:
@@ -655,7 +703,7 @@ def generate_ai_response(
             rows_sorted = sorted(rows, key=lambda r: rank_row(r), reverse=True)
             suggested_products = [map_product_row(r) for r in rows_sorted[:6]]
             
-            print(f"🔍 [SEARCH] Found {len(suggested_products)} products")
+            print(f"🔍 [SEARCH] Found {len(suggested_products)} products (fallback level: {search_fallback_level})")
         
         # Format the chat prompt with context
         formatted_prompt = CHAT_PROMPT.format(
@@ -668,6 +716,25 @@ def generate_ai_response(
             products_found=len(suggested_products),
             user_message=user_message
         )
+        
+        # ADD PRODUCT DETAILS TO PROMPT (so AI knows exact prices)
+        if suggested_products:
+            formatted_prompt += "\n\n📦 **SẢN PHẨM TÌM ĐƯỢC** (PHẢI dùng thông tin này, KHÔNG được bịa):\n"
+            for i, prod in enumerate(suggested_products[:6], 1):
+                price = prod.get('price', 0)
+                name = prod.get('name', 'Không rõ tên')
+                formatted_prompt += f"{i}. {name} - Giá: {int(price):,}đ\n"
+            formatted_prompt += "\n⚠️ QUAN TRỌNG: Khi đề cập giá, PHẢI dùng CHÍNH XÁC giá trên, KHÔNG được làm tròn hoặc bịa số khác!\n"
+        
+        # ADD FALLBACK INFO TO PROMPT
+        if search_fallback_level > 0:
+            fallback_notes = {
+                1: "Sản phẩm tìm được bằng cách mở rộng từ khóa",
+                2: "Sản phẩm tìm được sau khi bỏ giới hạn giá",
+                3: "Sản phẩm tìm được theo loại tương tự",
+                4: "Sản phẩm gợi ý phổ biến cho bạn"
+            }
+            formatted_prompt += f"\n\n⚠️ LƯU Ý: {fallback_notes[search_fallback_level]}. Hãy GIẢI THÍCH rõ ràng cho khách hàng tại sao không tìm thấy sản phẩm chính xác, và ĐỀ XUẤT các sản phẩm thay thế một cách TỰ NHIÊN, TÍCH CỰC."
         
         # Prepare content for Gemini
         if file_path:
@@ -809,7 +876,6 @@ def _parse_number(s: Any) -> float | None:
         s = str(s).strip().lower()
         if not s:
             return None
-        # Remove units and non-numeric except dot and comma
         s = s.replace('cm', '').replace('kg', '').replace('m', ' ').replace(',', '.')
         s = ''.join(ch for ch in s if ch.isdigit() or ch == '.' or ch == ' ')
         s = s.strip()
@@ -983,12 +1049,11 @@ def recommend_size_api():
 def health():
     return jsonify({"ok": True})
 
-
-
 if __name__ == "__main__":
     # set GEMINI_API_KEY=... && set SUPABASE_URL=... && set SUPABASE_ANON_KEY=... && python app_gemini_product_search.py
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
