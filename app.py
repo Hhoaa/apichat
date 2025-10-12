@@ -5,8 +5,8 @@ import sys
 import json
 import tempfile
 import mimetypes
-from typing import List, Dict, Any, Tuple, Optional
 import re
+from typing import List, Dict, Any, Tuple, Optional
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -21,7 +21,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 # -----------------------------
 # Config via environment vars
 # -----------------------------
-GEMINI_API_KEY = "AIzaSyAnTWIwWI0qYMVSJhE3vBky9ysk0riYDag"
+GEMINI_API_KEY = "AIzaSyC_mgnRedmnOFnhgL6vLZmKNTAHUudK0pc"
 SUPABASE_URL ="https://acddbjalchiruigappqg.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFjZGRiamFsY2hpcnVpZ2FwcHFnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTkwMzAzMTQsImV4cCI6MjA3NDYwNjMxNH0.Psefs-9-zIwe8OjhjQOpA19MddU3T9YMcfFtMcYQQS4"
 
@@ -32,7 +32,7 @@ if not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_ANON_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-model = genai.GenerativeModel("gemini-2.5-flash-lite")
+model = genai.GenerativeModel("gemini-2.0-flash")
 
 app = Flask(__name__)
 CORS(app)
@@ -925,12 +925,14 @@ def recommend_size(
         {'size': 'M', 'bust_max': 88, 'waist_max': 70},
         {'size': 'L', 'bust_max': 92, 'waist_max': 74},
         {'size': 'XL', 'bust_max': 96, 'waist_max': 78},
+        {'size': 'XXL', 'bust_max': 100, 'waist_max': 82},
     ]
     bottom_chart = [
         {'size': 'S', 'waist_max': 66, 'hip_max': 90},
         {'size': 'M', 'waist_max': 70, 'hip_max': 94},
         {'size': 'L', 'waist_max': 74, 'hip_max': 98},
         {'size': 'XL', 'waist_max': 78, 'hip_max': 102},
+        {'size': 'XXL', 'waist_max': 82, 'hip_max': 106},
     ]
 
     if height_cm and weight_kg:
@@ -943,8 +945,10 @@ def recommend_size(
             size = 'M'
         elif bmi < 27.5:
             size = 'L'
-        else:
+        elif bmi < 30:
             size = 'XL'
+        else:
+            size = 'XXL'  # Thêm size XXL cho BMI > 30
 
     cat = (category or '').lower()
     if cat in ('top', 'dress') and (bust_cm or waist_cm):
@@ -965,12 +969,14 @@ def recommend_size(
                 break
 
     if height_cm:
-        if height_cm < 155 and size in ('M', 'L', 'XL'):
+        if height_cm < 155 and size in ('M', 'L', 'XL', 'XXL'):
             reasons.append('thấp, giảm 1 size')
-            size = 'S' if size == 'M' else ('M' if size == 'L' else 'L')
+            size_map = {'M': 'S', 'L': 'M', 'XL': 'L', 'XXL': 'XL'}
+            size = size_map.get(size, size)
         if height_cm > 170 and size in ('S', 'M'):
             reasons.append('cao, tăng 1 size')
-            size = 'M' if size == 'S' else 'L'
+            size_map = {'S': 'M', 'M': 'L'}
+            size = size_map.get(size, size)
 
     return {
         'size': size,
@@ -1003,43 +1009,74 @@ def recommend_size_api():
         height = parse_height_cm(height_raw)
         weight = parse_weight_kg(weight_raw)
 
-        if use_gemini:
+        # Luôn sử dụng Gemini để gợi ý size
+        try:
+            prompt = (
+                "Bạn là stylist chuyên nghiệp. Hãy gợi ý size cho phụ nữ (S/M/L/XL/XXL) dựa trên số đo sau:\n"
+                f"Chiều cao: {height_raw}, Cân nặng: {weight_raw}, Ngực: {bust}cm, Eo: {waist}cm, Mông: {hip}cm\n"
+                f"Danh mục: {category or 'không rõ'}, Giới tính: {gender or 'không rõ'}\n\n"
+                "HƯỚNG DẪN GỢI Ý SIZE:\n"
+                "1. Tính BMI = cân nặng(kg) / (chiều cao(m))²\n"
+                "2. Xem xét số đo cụ thể (ngực, eo, mông)\n"
+                "3. Điều chỉnh theo chiều cao:\n"
+                "   - Người thấp (<155cm): có thể giảm 1 size\n"
+                "   - Người cao (>170cm): có thể tăng 1 size\n"
+                "4. Xem xét danh mục sản phẩm (top/dress/bottom)\n\n"
+                "QUY TẮC SIZE THAM KHẢO:\n"
+                "- S: BMI < 18.5, số đo nhỏ, ngực ≤84cm, eo ≤66cm\n"
+                "- M: BMI 18.5-23, cân đối, ngực ≤88cm, eo ≤70cm\n"
+                "- L: BMI 23-27.5, hơi đầy đặn, ngực ≤92cm, eo ≤74cm\n"
+                "- XL: BMI 27.5-30, đầy đặn, ngực ≤96cm, eo ≤78cm\n"
+                "- XXL: BMI > 30, rất đầy đặn, ngực ≤100cm, eo ≤82cm\n\n"
+                "Trả về JSON duy nhất: {\"size\":\"S|M|L|XL|XXL\", \"notes\":\"lý do chi tiết\", \"bmi\":\"BMI tính được\"}"
+            )
+            
+            resp = model.generate_content([prompt])
+            text = (resp.text or '').strip()
+            
+            # Xử lý response từ Gemini
+            if text.startswith("```"):
+                lines = text.split("\n")
+                text = "\n".join(lines[1:-1]) if len(lines) > 2 else text
+            text = text.strip()
+            
             try:
-                prompt = (
-                    "Bạn là stylist. Hãy gợi ý size cho phụ nữ (S/M/L/XL) và lý do dựa trên số đo sau\n"
-                    f"Chiều cao: {height_raw}, Cân nặng: {weight_raw}, Ngực: {bust}cm, Eo: {waist}cm, Mông: {hip}cm\n"
-                    f"Danh mục: {category or 'không rõ'}, Giới tính: {gender or 'không rõ'}\n"
-                    "Trả về JSON duy nhất: {\"size\":\"S|M|L|XL\", \"notes\":\"lý do ngắn\"}"
-                )
-                resp = model.generate_content([prompt])
-                text = (resp.text or '').strip()
-                try:
-                    rec = json.loads(text)
-                    if isinstance(rec, dict) and rec.get('size'):
-                        size = str(rec.get('size')).upper()
-                        if size not in ('S','M','L','XL'):
-                            size = 'M'
-                        return jsonify({
-                            'size': size,
-                            'notes': rec.get('notes') or 'Theo Gemini',
-                            'source': 'gemini'
-                        })
-                except Exception:
-                    pass
-            except Exception as e:
-                print(f"[recommend_size_api] gemini error: {e}")
-
-        result = recommend_size(
-            height_cm=height,
-            weight_kg=weight,
-            bust_cm=bust,
-            waist_cm=waist,
-            hip_cm=hip,
-            category=category,
-            gender=gender,
-        )
-        result['source'] = 'heuristic'
-        return jsonify(result)
+                rec = json.loads(text)
+                if isinstance(rec, dict) and rec.get('size'):
+                    size = str(rec.get('size')).upper()
+                    if size not in ('S','M','L','XL','XXL'):
+                        size = 'M'
+                    return jsonify({
+                        'size': size,
+                        'notes': rec.get('notes') or 'Theo Gemini AI',
+                        'bmi': rec.get('bmi', ''),
+                        'source': 'gemini'
+                    })
+            except json.JSONDecodeError:
+                # Fallback: tìm size trong text
+                size_match = re.search(r'\b(S|M|L|XL|XXL)\b', text, re.IGNORECASE)
+                if size_match:
+                    size = size_match.group(1).upper()
+                    return jsonify({
+                        'size': size,
+                        'notes': f'Gemini gợi ý: {text[:100]}...',
+                        'source': 'gemini'
+                    })
+            
+        except Exception as e:
+            print(f"[recommend_size_api] gemini error: {e}")
+            # Fallback về heuristic nếu Gemini lỗi
+            result = recommend_size(
+                height_cm=height,
+                weight_kg=weight,
+                bust_cm=bust,
+                waist_cm=waist,
+                hip_cm=hip,
+                category=category,
+                gender=gender,
+            )
+            result['source'] = 'heuristic_fallback'
+            return jsonify(result)
     except Exception as e:
         print(f"❌ Error /api/recommend_size: {e}")
         return jsonify({'error': f'Lỗi máy chủ: {str(e)}'}), 500
@@ -1053,6 +1090,7 @@ if __name__ == "__main__":
     # set GEMINI_API_KEY=... && set SUPABASE_URL=... && set SUPABASE_ANON_KEY=... && python app_gemini_product_search.py
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
