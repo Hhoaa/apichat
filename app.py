@@ -32,7 +32,7 @@ if not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_ANON_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-model = genai.GenerativeModel("gemini-2.0-flash")
+model = genai.GenerativeModel("gemini-2.5-flash-lite")
 
 app = Flask(__name__)
 CORS(app)
@@ -1053,6 +1053,7 @@ if __name__ == "__main__":
     # set GEMINI_API_KEY=... && set SUPABASE_URL=... && set SUPABASE_ANON_KEY=... && python app_gemini_product_search.py
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
