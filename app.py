@@ -21,7 +21,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 # -----------------------------
 # Config via environment vars
 # -----------------------------
-GEMINI_API_KEY = "AIzaSyC_mgnRedmnOFnhgL6vLZmKNTAHUudK0pc"
+GEMINI_API_KEY = "AIzaSyAl3Kc7fo8_T9rAMhEqocw5d7gchtLL1Wg"
 SUPABASE_URL ="https://acddbjalchiruigappqg.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFjZGRiamFsY2hpcnVpZ2FwcHFnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTkwMzAzMTQsImV4cCI6MjA3NDYwNjMxNH0.Psefs-9-zIwe8OjhjQOpA19MddU3T9YMcfFtMcYQQS4"
 
@@ -1090,6 +1090,7 @@ if __name__ == "__main__":
     # set GEMINI_API_KEY=... && set SUPABASE_URL=... && set SUPABASE_ANON_KEY=... && python app_gemini_product_search.py
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
