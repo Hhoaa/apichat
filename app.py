@@ -21,7 +21,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 # -----------------------------
 # Config via environment vars
 # -----------------------------
-GEMINI_API_KEY = "AIzaSyAl3Kc7fo8_T9rAMhEqocw5d7gchtLL1Wg"
+GEMINI_API_KEY = "AIzaSyAUKSanKwixXDaNx4MKrlywbL0b6Sm8Opw"
 SUPABASE_URL ="https://acddbjalchiruigappqg.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFjZGRiamFsY2hpcnVpZ2FwcHFnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTkwMzAzMTQsImV4cCI6MjA3NDYwNjMxNH0.Psefs-9-zIwe8OjhjQOpA19MddU3T9YMcfFtMcYQQS4"
 
@@ -32,7 +32,7 @@ if not GEMINI_API_KEY or not SUPABASE_URL or not SUPABASE_ANON_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
 
-model = genai.GenerativeModel("gemini-2.0-flash")
+model = genai.GenerativeModel("gemini-2.5-flash")
 
 app = Flask(__name__)
 CORS(app)
@@ -453,51 +453,133 @@ def search_products():
         det_type = (extracted.get("type") or "").strip().lower() or None
         det_colors = [c.strip().lower() for c in (extracted.get("colors") or []) if isinstance(c, str) and c.strip()]
 
-        # Build search query
-        columns = ["ten_san_pham", "mo_ta_san_pham"]
-        or_clause = build_or_clause_for_keywords(columns, keywords)
+        # Build search query với logic mới: Tìm từng từ theo thứ tự ưu tiên
+        print(f"🔍 [SEARCH] Keywords: {keywords}")
+        print(f"🔍 [SEARCH] Type: {det_type}, Colors: {det_colors}")
         
-        q = supabase.table("products").select(
+        # Bước 1: Tách tất cả keywords thành từng từ riêng lẻ và sắp xếp theo thứ tự ưu tiên
+        all_search_terms = []
+        
+        # Ưu tiên 1: Type (váy, đầm, áo, quần...)
+        if det_type:
+            all_search_terms.append(("type", det_type))
+        
+        # Ưu tiên 2: Màu sắc
+        if det_colors:
+            for color in det_colors[:2]:
+                all_search_terms.append(("color", color))
+        
+        # Ưu tiên 3: Từng keyword (tách thành từ đơn)
+        for keyword in keywords:
+            words = keyword.split()
+            for word in words:
+                if len(word) > 2:  # Bỏ qua từ quá ngắn
+                    # Loại bỏ các từ không cần thiết
+                    stop_words = ['có', 'với', 'và', 'the', 'a', 'an', 'của', 'cho']
+                    if word.lower() not in stop_words:
+                        all_search_terms.append(("keyword", word))
+        
+        # Loại bỏ duplicate nhưng giữ thứ tự
+        seen = set()
+        prioritized_terms = []
+        for term_type, term_value in all_search_terms:
+            term_lower = term_value.lower()
+            if term_lower not in seen:
+                seen.add(term_lower)
+                prioritized_terms.append((term_type, term_value))
+        
+        print(f"🔍 [SEARCH] Prioritized search terms: {prioritized_terms[:10]}")
+        
+        # Bước 2: Tìm kiếm tuần tự - mỗi lần filter thêm một từ
+        rows = []
+        current_query = supabase.table("products").select(
             "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
         )
         
-        # Apply filters
+        # Apply price filters trước
         if min_price is not None:
-            q = q.gte("gia_ban", min_price)
+            current_query = current_query.gte("gia_ban", min_price)
             print(f"💰 [FILTER] Min price: {min_price}")
         if max_price is not None:
-            q = q.lte("gia_ban", max_price)
+            current_query = current_query.lte("gia_ban", max_price)
             print(f"💰 [FILTER] Max price: {max_price}")
-        if det_type:
-            type_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], [det_type])
-            if type_clause:
-                q = q.or_(type_clause)
-        if det_colors:
-            color_clause = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], det_colors[:2])
-            if color_clause:
-                q = q.or_(color_clause)
-        if or_clause:
-            q = q.or_(or_clause)
         
-        resp = q.limit(20).execute()
-        rows = resp.data or []
-
-        # Fallback search if no results
-        if not rows and keywords:
-            single_tokens = [t for t in keywords if len(t.split()) == 1]
-            if single_tokens:
-                or_clause_2 = build_or_clause_for_keywords(["ten_san_pham", "mo_ta_san_pham"], single_tokens)
-                q2 = supabase.table("products").select(
+        # Tìm kiếm tuần tự với từng từ
+        previous_rows = []  # Lưu kết quả trước đó để rollback nếu filter ra 0
+        for i, (term_type, term_value) in enumerate(prioritized_terms[:5]):  # Giới hạn 5 từ để tránh quá phức tạp
+            print(f"🔍 [STEP {i+1}] Searching for '{term_value}' (type: {term_type})")
+            
+            # Tạo query mới với điều kiện search từ này
+            search_clause = f"ten_san_pham.ilike.%{term_value}%,mo_ta_san_pham.ilike.%{term_value}%"
+            
+            try:
+                # Nếu đã có kết quả từ bước trước, filter tiếp trong kết quả đó
+                if rows:
+                    # Lưu kết quả trước đó để rollback nếu cần
+                    previous_rows = rows.copy()
+                    
+                    # Filter trong memory (vì Supabase không hỗ trợ filter trên kết quả đã có)
+                    filtered_rows = []
+                    for row in rows:
+                        name = (row.get("ten_san_pham") or "").lower()
+                        desc = (row.get("mo_ta_san_pham") or "").lower()
+                        if term_value.lower() in name or term_value.lower() in desc:
+                            filtered_rows.append(row)
+                    
+                    # QUAN TRỌNG: Nếu filter ra 0, quay lại kết quả trước đó
+                    if len(filtered_rows) > 0:
+                        rows = filtered_rows
+                        print(f"  ✅ Filtered to {len(rows)} products")
+                    else:
+                        # Filter ra 0, quay lại kết quả trước đó
+                        rows = previous_rows
+                        print(f"  ⚠️  Filtered to 0, keeping previous {len(rows)} products")
+                else:
+                    # Lần đầu tiên, query từ database
+                    step_query = current_query.or_(search_clause)
+                    resp = step_query.limit(50).execute()  # Lấy nhiều hơn để có thể filter tiếp
+                    rows = resp.data or []
+                    previous_rows = rows.copy()  # Lưu kết quả đầu tiên
+                    print(f"  ✅ Found {len(rows)} products")
+                
+                # Nếu đã có đủ kết quả (>= 10), có thể dừng sớm
+                if len(rows) >= 10:
+                    print(f"  ⏹️  Stopping early with {len(rows)} products")
+                    break
+                    
+            except Exception as e:
+                print(f"  ❌ Error searching for '{term_value}': {e}")
+                # Nếu có lỗi và đã có kết quả trước đó, giữ kết quả đó
+                if previous_rows:
+                    rows = previous_rows
+                    print(f"  ⚠️  Error occurred, keeping previous {len(rows)} products")
+                # Tiếp tục với từ tiếp theo
+                continue
+        
+        # Nếu vẫn không có kết quả, thử search đơn giản hơn
+        if not rows and prioritized_terms:
+            print(f"🔄 [FALLBACK] No results, trying simple search with first term")
+            first_term = prioritized_terms[0][1]
+            try:
+                fallback_query = supabase.table("products").select(
                     "ma_san_pham,ten_san_pham,mo_ta_san_pham,gia_ban,muc_gia_goc,product_images(duong_dan_anh)"
                 )
                 if min_price is not None:
-                    q2 = q2.gte("gia_ban", min_price)
+                    fallback_query = fallback_query.gte("gia_ban", min_price)
                 if max_price is not None:
-                    q2 = q2.lte("gia_ban", max_price)
-                if or_clause_2:
-                    q2 = q2.or_(or_clause_2)
-                resp2 = q2.limit(20).execute()
-                rows = resp2.data or []
+                    fallback_query = fallback_query.lte("gia_ban", max_price)
+                fallback_query = fallback_query.or_(f"ten_san_pham.ilike.%{first_term}%,mo_ta_san_pham.ilike.%{first_term}%")
+                resp = fallback_query.limit(20).execute()
+                rows = resp.data or []
+                print(f"✅ [FALLBACK] Found {len(rows)} products with '{first_term}'")
+            except Exception as e:
+                print(f"❌ [FALLBACK] Error: {e}")
+        
+        print(f"🔍 [SEARCH] Final result: {len(rows)} products")
+        if rows:
+            print(f"📦 [DEBUG] Sample products:")
+            for i, row in enumerate(rows[:3]):
+                print(f"  {i+1}. {row.get('ten_san_pham', 'N/A')}")
         
         # Sort by relevance
         def rank_row(r: Dict[str, Any]) -> tuple:
@@ -1085,11 +1167,11 @@ def recommend_size_api():
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"ok": True})
-
 if __name__ == "__main__":
     # set GEMINI_API_KEY=... && set SUPABASE_URL=... && set SUPABASE_ANON_KEY=... && python app_gemini_product_search.py
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
+
 
 
 
